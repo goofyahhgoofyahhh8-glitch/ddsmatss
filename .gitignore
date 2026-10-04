@@ -1,0 +1,22 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ddsmat artifacts
+builds/
+drops/
+config.json
+*.ico
+*.spec
+
+# pyinstaller
+build/
+dist/
+
+# local
+.env
+*.log
+.DS_Store
